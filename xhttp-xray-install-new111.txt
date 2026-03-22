@@ -1,0 +1,226 @@
+#!/bin/bash
+set -e
+
+echo "Будет установлен VLESS (TCP + XHTTP, Reality)"
+sleep 2
+
+# Проверка root
+if [ "$EUID" -ne 0 ]; then
+  echo "Запусти от root"
+  exit 1
+fi
+
+apt update
+apt install -y qrencode curl jq openssl
+
+# === BBR ===
+if sysctl net.ipv4.tcp_congestion_control | grep -q bbr; then
+  echo "BBR уже включен"
+else
+  grep -q "tcp_congestion_control=bbr" /etc/sysctl.conf || {
+    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+  }
+  sysctl -p
+fi
+
+# === Установка Xray ===
+bash -c "$(curl -4 -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+
+# Проверка Xray
+command -v xray >/dev/null || { echo "Xray не установлен"; exit 1; }
+
+# === Ключи ===
+KEY_FILE="/usr/local/etc/xray/.keys"
+rm -f $KEY_FILE
+
+UUID=$(xray uuid)
+SHORTID=$(openssl rand -hex 8)
+
+KEYPAIR=$(xray x25519)
+PRIVATE_KEY=$(echo "$KEYPAIR" | grep PrivateKey | awk '{print $2}')
+PUBLIC_KEY=$(echo "$KEYPAIR" | grep PublicKey | awk '{print $2}')
+
+cat > $KEY_FILE <<EOF
+uuid: $UUID
+shortsid: $SHORTID
+PrivateKey: $PRIVATE_KEY
+PublicKey: $PUBLIC_KEY
+EOF
+
+# === CONFIG ===
+cat <<EOF > /usr/local/etc/xray/config.json
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [
+    {
+      "tag": "tcp",
+      "listen": "0.0.0.0",
+      "port": 443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [{"email": "main","id": "$UUID"}],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "target": "github.com:443",
+          "serverNames": ["github.com"],
+          "privateKey": "$PRIVATE_KEY",
+          "shortIds": ["$SHORTID"]
+        }
+      }
+    },
+    {
+      "tag": "xhttp",
+      "listen": "0.0.0.0",
+      "port": 8443,
+      "protocol": "vless",
+      "settings": {
+        "clients": [{"email": "main","id": "$UUID"}],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "reality",
+        "xhttpSettings": {
+          "path": "/",
+          "mode": "auto"
+        },
+        "realitySettings": {
+          "target": "github.com:443",
+          "serverNames": ["github.com"],
+          "privateKey": "$PRIVATE_KEY",
+          "shortIds": ["$SHORTID"]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {"protocol": "freedom"},
+    {"protocol": "blackhole"}
+  ]
+}
+EOF
+
+# === ФУНКЦИЯ ССЫЛОК ===
+cat << 'EOF' > /usr/local/bin/gen_vless_links
+#!/bin/bash
+
+uuid=$1
+name=$2
+
+ip=$(curl -4 -s --max-time 5 ifconfig.me || curl -4 -s icanhazip.com)
+pbk=$(grep PublicKey /usr/local/etc/xray/.keys | awk '{print $2}')
+sid=$(grep shortsid /usr/local/etc/xray/.keys | awk '{print $2}')
+sni="github.com"
+
+tcp="vless://$uuid@$ip:443?security=reality&sni=$sni&fp=firefox&pbk=$pbk&sid=$sid&type=tcp#$name"
+xhttp="vless://$uuid@$ip:8443?security=reality&path=%2F&mode=auto&sni=$sni&fp=firefox&pbk=$pbk&sid=$sid&type=xhttp#$name"
+
+echo ""
+echo "=== TCP ==="
+echo "$tcp"
+echo "$tcp" | qrencode -t ansiutf8
+
+echo ""
+echo "=== XHTTP ==="
+echo "$xhttp"
+echo "$xhttp" | qrencode -t ansiutf8
+EOF
+
+chmod +x /usr/local/bin/gen_vless_links
+
+# === mainuser ===
+cat << 'EOF' > /usr/local/bin/mainuser
+#!/bin/bash
+uuid=$(grep uuid /usr/local/etc/xray/.keys | awk '{print $2}')
+/usr/local/bin/gen_vless_links $uuid main
+EOF
+
+chmod +x /usr/local/bin/mainuser
+
+# === newuser ===
+cat << 'EOF' > /usr/local/bin/newuser
+#!/bin/bash
+read -p "Введите имя: " email
+uuid=$(xray uuid)
+
+tmp=$(mktemp)
+
+jq --arg e "$email" --arg u "$uuid" \
+'.inbounds[0].settings.clients += [{"email":$e,"id":$u}]' \
+/usr/local/etc/xray/config.json > $tmp && mv $tmp /usr/local/etc/xray/config.json
+
+systemctl restart xray
+/usr/local/bin/gen_vless_links $uuid $email
+EOF
+
+chmod +x /usr/local/bin/newuser
+
+# === userlist ===
+cat << 'EOF' > /usr/local/bin/userlist
+#!/bin/bash
+jq -r '.inbounds[0].settings.clients[].email' /usr/local/etc/xray/config.json
+EOF
+
+chmod +x /usr/local/bin/userlist
+
+# === rmuser ===
+cat << 'EOF' > /usr/local/bin/rmuser
+#!/bin/bash
+read -p "Введите email: " email
+tmp=$(mktemp)
+
+jq --arg e "$email" \
+'(.inbounds[0].settings.clients)|=map(select(.email!=$e))' \
+/usr/local/etc/xray/config.json > $tmp && mv $tmp /usr/local/etc/xray/config.json
+
+systemctl restart xray
+echo "Удален"
+EOF
+
+chmod +x /usr/local/bin/rmuser
+
+# === alllinks ===
+cat << 'EOF' > /usr/local/bin/alllinks
+#!/bin/bash
+for email in $(jq -r '.inbounds[0].settings.clients[].email' /usr/local/etc/xray/config.json); do
+uuid=$(jq -r ".inbounds[0].settings.clients[]|select(.email==\"$email\")|.id" /usr/local/etc/xray/config.json)
+/usr/local/bin/gen_vless_links $uuid $email
+done
+EOF
+
+chmod +x /usr/local/bin/alllinks
+
+# === xrayctl ===
+cat << 'EOF' > /usr/local/bin/xrayctl
+#!/bin/bash
+echo "1 mainuser"
+echo "2 newuser"
+echo "3 rmuser"
+echo "4 userlist"
+echo "5 alllinks"
+echo "6 restart"
+
+read -p "Выбор: " c
+
+case $c in
+1) mainuser ;;
+2) newuser ;;
+3) rmuser ;;
+4) userlist ;;
+5) alllinks ;;
+6) systemctl restart xray ;;
+esac
+EOF
+
+chmod +x /usr/local/bin/xrayctl
+
+systemctl enable xray
+systemctl restart xray
+
+echo "Установка завершена"
+mainuser
