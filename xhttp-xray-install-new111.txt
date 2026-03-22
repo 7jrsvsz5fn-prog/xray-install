@@ -66,10 +66,11 @@ cat <<EOF > /usr/local/etc/xray/config.json
         "network": "tcp",
         "security": "reality",
         "realitySettings": {
-          "target": "github.com:443",
+          "dest": "github.com:443",
           "serverNames": ["github.com"],
           "privateKey": "$PRIVATE_KEY",
-          "shortIds": ["$SHORTID"]
+          "shortIds": ["$SHORTID"],
+          "show": false
         }
       }
     },
@@ -90,10 +91,11 @@ cat <<EOF > /usr/local/etc/xray/config.json
           "mode": "auto"
         },
         "realitySettings": {
-          "target": "github.com:443",
+          "dest": "github.com:443",
           "serverNames": ["github.com"],
           "privateKey": "$PRIVATE_KEY",
-          "shortIds": ["$SHORTID"]
+          "shortIds": ["$SHORTID"],
+          "show": false
         }
       }
     }
